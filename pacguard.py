@@ -20,10 +20,13 @@ lists a directory, asks git for the status and runs pac.
     python pacguard.py agents/support --pack --publisher-prefix demo --output-path out
     python pacguard.py agents/support --pack --publisher-prefix demo --output-path out --apply
 
-Checks, all without writing anything:
+Checks, all without writing anything (git runs with --no-optional-locks, so
+it does not refresh the index either):
 
-  git state   a push needs a clean worktree, so the last committed state is a
-              rollback point. --allow-dirty overrides, loudly.
+  git state   a push needs a clean worktree with at least one tracked file, so
+              the last committed state is a rollback point. A workspace that git
+              ignores has none and reads UNKNOWN. --allow-dirty overrides,
+              loudly.
   pack layout pac copilot pack validates a classic workspace (agent.mcs.yml) and
               rejects the extra files a cloned agent carries. This tool refuses
               before the call and lists every entry at once. A CLI-authored
@@ -33,10 +36,11 @@ Checks, all without writing anything:
 Nothing is written by pacguard itself. pac writes when pacguard runs it, and
 pacguard runs it for push or pack only with --apply.
 
-Exit codes: 0 every check passed (and the call ran, with --apply), 1 a check
-refused the run, 2 a workspace or pac could not be found or read, 3 pac ran and
-exited non-zero, 64 usage error, 70 an unexpected crash, which is never a
-finding.
+Exit codes: 0 no check refused the run (and the call ran, with --apply). A run
+with neither --push nor --pack only reports and always exits 0, whatever it
+printed, so read the verdict lines. 1 a check refused the run, 2 a workspace or
+pac could not be found or read, 3 pac ran and exited non-zero, 64 usage error,
+70 an unexpected crash, which is never a finding.
 """
 
 from __future__ import print_function
@@ -67,10 +71,14 @@ ALLOWED_CALLS = ("auth who", "copilot list", "copilot push", "copilot pack")
 
 # Entries pac copilot pack rejected at the top of a classic workspace, observed
 # on pac 2.14.1 (see README). The first group is what a cloned agent carries.
-# The second is version control and editor files, which any workspace kept in
-# git carries. Matching is case-insensitive.
+# The second is other names the probe runs saw rejected. The third is version
+# control and editor files, which any workspace kept in git carries. The lists
+# are not complete: pac rejected every other name tried too. Matching is
+# case-insensitive.
 CLONED_ENTRIES = ("actions", "connectionreferences.mcs.yml", "connectors",
                   "knowledge", "workflows")
+PROBED_ENTRIES = ("botcomponents", "components", "dialogs", "entities", "extra",
+                  "skills", "translations", "variables")
 TOOLING_ENTRIES = (".editorconfig", ".git", ".gitattributes", ".github",
                    ".gitignore", ".vscode", "license", "readme.md")
 
@@ -88,9 +96,11 @@ DIRTY = "DIRTY"
 UNKNOWN = "UNKNOWN"
 
 # A pac output line holding any of these words is withheld. pac auth who prints
-# a token expiry line, and a future version could print more.
-SECRET_WORDS = re.compile(r"token|secret|password|bearer|authorization|"
-                          r"credential", re.IGNORECASE)
+# a token expiry line, and a future version could print more. It is a keyword
+# filter, not a secret detector: a secret on a line without these words passes.
+SECRET_LIST = ("token", "secret", "password", "bearer", "authorization",
+               "credential")
+SECRET_WORDS = re.compile("|".join(SECRET_LIST), re.IGNORECASE)
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -157,17 +167,22 @@ def pack_verdict(entries):
         return LAYOUT_UNKNOWN, []
     rejected = []
     for name, is_dir in sorted(entries, key=lambda e: e[0].lower()):
-        if name.lower() in CLONED_ENTRIES + TOOLING_ENTRIES:
+        if name.lower() in CLONED_ENTRIES + PROBED_ENTRIES + TOOLING_ENTRIES:
             rejected.append(name + "/" if is_dir else name)
     return LAYOUT_CLASSIC, rejected
 
 
-def classify_git(returncode, stdout):
-    """CLEAN, DIRTY or UNKNOWN from one git status --porcelain result.
-    UNKNOWN means git could not answer, which is not the same as clean."""
+def classify_git(returncode, stdout, tracked=True):
+    """CLEAN, DIRTY or UNKNOWN from one git status --porcelain result and
+    whether git tracks a file in the workspace. UNKNOWN means git could not
+    answer, which is not the same as clean. A workspace with nothing tracked
+    and nothing to report, such as one that git ignores, has no rollback point
+    to be clean against, so it is UNKNOWN too."""
     if returncode != 0:
         return UNKNOWN
-    return DIRTY if stdout.strip() else CLEAN
+    if stdout.strip():
+        return DIRTY
+    return CLEAN if tracked else UNKNOWN
 
 
 class Assessment(object):
@@ -254,12 +269,19 @@ def list_entries(path):
 
 
 def git_state(path, git="git"):
+    """--no-optional-locks keeps git status from rewriting .git/index.
+    --untracked-files=all overrides a status.showUntrackedFiles setting that
+    would hide a new file. "-- ." scopes status to the workspace, and ls-files
+    lists only the current directory by default."""
+    base = [git, "--no-optional-locks"]
     try:
-        rc, out, _ = run_command([git, "status", "--porcelain", "--", "."],
-                                 cwd=path)
+        rc, out, _ = run_command(
+            base + ["status", "--porcelain", "--untracked-files=all", "--",
+                    "."], cwd=path)
+        _, listed, _ = run_command(base + ["ls-files", "--cached"], cwd=path)
     except OSError:
         return UNKNOWN
-    return classify_git(rc, out)
+    return classify_git(rc, out, bool(listed.strip()))
 
 
 def assess(path):
@@ -297,7 +319,8 @@ def describe(a):
     print("  layout: %s" % a.layout)
     note = {CLEAN: "no uncommitted changes",
             DIRTY: "uncommitted changes",
-            UNKNOWN: "git could not say, so the state is not known"}[a.git]
+            UNKNOWN: "git could not say, or tracks no file here, so the "
+                     "state is not known"}[a.git]
     print("  git: %s (%s)" % (a.git, note))
     if a.layout == LAYOUT_CLI:
         print("  pack: ok (pac accepts extra entries in this layout)")
@@ -326,6 +349,8 @@ if args[:1] == ["auth"]:
     if "secret" in mode:
         print("Access Token: not-a-real-value-0001")
         print("Token Expires: tomorrow")
+    if "stderrleak" in mode:
+        sys.stderr.write("Authorization: Bearer not-a-real-value-0002\n")
     if "unicode" in mode:
         sys.stdout.buffer.write(b"snowman \xe2\x98\x83\n")
         sys.stdout.buffer.flush()
@@ -412,6 +437,13 @@ def _self_test(tmp):
         all_calls.extend(calls)
         return rc, out.getvalue(), err.getvalue(), calls
 
+    def commit_all(path):
+        run_command(["git", "add", "-A"], cwd=path)
+        run_command(["git", "-c", "user.name=t", "-c",
+                     "user.email=t@example.invalid", "-c",
+                     "commit.gpgsign=false", "commit", "-q", "-m", "x"],
+                    cwd=path)
+
     def make(name, files=(), dirs=(), commit=None):
         """A workspace. commit True makes a repository with one commit,
         False leaves untracked files in a repository, None no repository."""
@@ -425,11 +457,7 @@ def _self_test(tmp):
         if commit is not None:
             run_command(["git", "init", "-q"], cwd=path)
             if commit:
-                run_command(["git", "add", "-A"], cwd=path)
-                run_command(["git", "-c", "user.name=t", "-c",
-                             "user.email=t@example.invalid", "-c",
-                             "commit.gpgsign=false", "commit", "-q", "-m",
-                             "x"], cwd=path)
+                commit_all(path)
         return path
 
     classic = ("agent.mcs.yml", "settings.mcs.yml", "icon.png")
@@ -505,6 +533,24 @@ def _self_test(tmp):
     check(layout == LAYOUT_CLI and bad == [],
           "a CLI-authored workspace with the same extras is not refused"
           "  <-- pinned defect")
+    layout, bad = pack_verdict(entries(
+        "agent.mcs.yml", "extra/", "entities/", "variables/", "dialogs/",
+        "translations/", "skills/", "components/", "botcomponents/"))
+    check(bad == ["botcomponents/", "components/", "dialogs/", "entities/",
+                  "extra/", "skills/", "translations/", "variables/"],
+          "the eight other entries the probe runs saw rejected are listed too"
+          "  <-- pinned defect")
+    layout, bad = pack_verdict(entries("AGENT.MCS.YML", "Actions/"))
+    check(layout == LAYOUT_CLASSIC and bad == ["Actions/"],
+          "an upper-case classic marker is still found")
+    layout, bad = pack_verdict(entries("Agent.Sync.Yaml", "actions/"))
+    check(layout == LAYOUT_CLI and bad == [],
+          "an upper-case CLI marker is still found")
+    layout, bad = pack_verdict(entries(
+        "agent.sync.yaml", "agent.mcs.yml", "actions/"))
+    check(layout == LAYOUT_CLI and bad == [],
+          "with both markers the workspace counts as cli-authored and is "
+          "never refused")
     layout, bad = pack_verdict(entries("notes.txt"))
     check(layout == LAYOUT_UNKNOWN and bad == [],
           "a folder with neither marker is an unrecognised layout")
@@ -529,6 +575,69 @@ def _self_test(tmp):
           "a folder outside any repository is UNKNOWN")
     check(git_state(clean_ws, git="no-such-git-xyz") == UNKNOWN,
           "a missing git binary is UNKNOWN, not a crash")
+    check(classify_git(0, "", tracked=False) == UNKNOWN,
+          "nothing tracked and nothing to report is UNKNOWN, not CLEAN"
+          "  <-- pinned defect")
+    check(classify_git(0, "?? a\n", tracked=False) == DIRTY,
+          "an untracked file is DIRTY even when nothing is tracked yet")
+
+    # A workspace git ignores reports nothing and tracks nothing.
+    ign_root = make("ign", (), ("ws",))
+    run_command(["git", "init", "-q"], cwd=ign_root)
+    with open(os.path.join(ign_root, ".gitignore"), "w") as fh:
+        fh.write("ws/\n")
+    with open(os.path.join(ign_root, "ws", "agent.mcs.yml"), "w") as fh:
+        fh.write("synthetic: 1\n")
+    commit_all(ign_root)
+    check(git_state(os.path.join(ign_root, "ws")) == UNKNOWN,
+          "a workspace that git ignores is UNKNOWN, never CLEAN"
+          "  <-- pinned defect")
+
+    # A new file stays visible whatever the user's status settings say.
+    hide_ws = make("hide", classic, ("topics",), commit=True)
+    run_command(["git", "config", "status.showUntrackedFiles", "no"],
+                cwd=hide_ws)
+    with open(os.path.join(hide_ws, "topic-new.mcs.yml"), "w") as fh:
+        fh.write("synthetic: 1\n")
+    check(run_command(["git", "status", "--porcelain"], cwd=hide_ws)[1] == ""
+          and git_state(hide_ws) == DIRTY,
+          "a new file is DIRTY although status.showUntrackedFiles hides it"
+          "  <-- pinned defect")
+
+    # A workspace inside a larger repository is judged on its own files.
+    mono = make("mono", (), ("ws", "other"))
+    for sub in ("ws", "other"):
+        with open(os.path.join(mono, sub, "f.txt"), "w") as fh:
+            fh.write("synthetic: 1\n")
+    run_command(["git", "init", "-q"], cwd=mono)
+    commit_all(mono)
+    with open(os.path.join(mono, "other", "new.txt"), "w") as fh:
+        fh.write("synthetic: 1\n")
+    check(git_state(os.path.join(mono, "ws")) == CLEAN
+          and git_state(os.path.join(mono, "other")) == DIRTY,
+          "a dirty sibling folder does not make the workspace DIRTY"
+          "  <-- pinned defect")
+
+    # The check must not touch the repository. A file whose time changed
+    # makes plain git status rewrite .git/index, which is the write.
+    idx_ws = make("idx", classic, ("topics",), commit=True)
+    marker = os.path.join(idx_ws, "agent.mcs.yml")
+    stat = os.stat(marker)
+    os.utime(marker, (stat.st_atime, stat.st_mtime + 10))
+    index_path = os.path.join(idx_ws, ".git", "index")
+
+    def index_bytes():
+        with open(index_path, "rb") as fh:
+            return fh.read()
+
+    before = index_bytes()
+    git_state(idx_ws)
+    drive([idx_ws])
+    kept = index_bytes() == before
+    run_command(["git", "status", "--porcelain"], cwd=idx_ws)
+    check(kept and index_bytes() != before,
+          "the check leaves .git/index byte for byte as it was, and a plain "
+          "git status would not  <-- pinned defect")
 
     # ---- the decision
     def a_(git, rejected=(), layout=LAYOUT_CLASSIC):
@@ -561,6 +670,15 @@ def _self_test(tmp):
           "a line that names a token is withheld, the next line is kept")
     check(scrub("CLIENT SECRET=1")[0].startswith("[line withheld"),
           "the match ignores case")
+    for word in ("token", "secret", "password", "bearer", "authorization",
+                 "credential"):
+        check(scrub("x %s y" % word)[0].startswith("[line withheld")
+              and scrub("x %s y" % word.upper())[0].startswith("[line"),
+              "a line holding %r is withheld in either case  <-- pinned "
+              "defect" % word)
+    check(scrub("sig=abc123 key=zzz") == ["sig=abc123 key=zzz"],
+          "a line with none of the six words is printed, the filter is a "
+          "keyword list and not a secret detector")
     check(scrub("") == [], "empty output is no lines")
     buf = io.StringIO()
     echo("a\n\nb\n", buf)
@@ -643,14 +761,33 @@ def _self_test(tmp):
     check("pac rejects .git/, actions/, connectionreferences.mcs.yml, "
           "connectors/, knowledge/, workflows/" in out,
           "a cloned workspace shows its pack verdict even on a plain check")
+    rc, out, err, calls = drive([plain_ws, "--offline"])
+    check(rc == 0 and "git: UNKNOWN" in out,
+          "a report-only run exits 0 even when git is UNKNOWN, as the README "
+          "says")
+    rc, out, err, calls = drive([tmp, "--offline"])
+    check(rc == 0 and "layout: unrecognised" in out
+          and "not an agent workspace" in out,
+          "a report-only run exits 0 even for a folder that is not a "
+          "workspace, as the README says")
     rc, out, err, calls = drive([clean_ws, "--offline"])
     check(rc == 0 and calls == [] and "tester" not in out,
           "--offline starts no pac process at all")
+    upper_stub = os.path.join(tmp, "STUBUP.PY")
+    shutil.copyfile(stub, upper_stub)
+    rc, out, err, calls = drive([clean_ws, "--pac", upper_stub])
+    check(rc == 0 and calls == ["auth who", "copilot list"],
+          "a stand-in whose name ends in .PY runs under this Python")
     rc, out, err, calls = drive([clean_ws], mode="secret")
     check(rc == 0 and "not-a-real-value-0001" not in out + err
           and "Token Expires" not in out + err and "withheld" in out
           and "tester@example.invalid" in out,
           "a credential-looking line from pac never reaches the output"
+          "  <-- pinned defect")
+    rc, out, err, calls = drive([clean_ws], mode="stderrleak")
+    check(rc == 0 and "not-a-real-value-0002" not in out + err
+          and "withheld" in err,
+          "a credential-looking line on pac's stderr is withheld too"
           "  <-- pinned defect")
     rc, out, err, calls = drive([clean_ws], mode="auth")
     check(rc == EXIT_PAC and calls == ["auth who"] and "exited 7" in err,
@@ -700,6 +837,10 @@ def _self_test(tmp):
                                 "copilot push --project-dir " + clean_ws]
           and "pushed" in out,
           "--push --apply runs who, list and then exactly one push")
+    rc, out, err, calls = drive([clean_ws, "--push", "--apply",
+                                 "--allow-dirty"])
+    check(rc == 0 and "ALLOW-DIRTY" not in out,
+          "--allow-dirty on a clean worktree prints no warning")
     rc, out, err, calls = drive([dirty_ws, "--push", "--apply",
                                  "--allow-dirty"])
     check(rc == 0 and calls[-1] == "copilot push --project-dir " + dirty_ws
@@ -711,6 +852,13 @@ def _self_test(tmp):
     rc, out, err, calls = drive([clean_ws, "--push", "--apply"], mode="auth")
     check(rc == EXIT_PAC and calls == ["auth who"],
           "a failed sign-in check stops the push before it starts")
+
+    notws = make("notws", ("notes.txt",), commit=True)
+    rc, out, err, calls = drive([notws, "--push", "--apply"])
+    check(rc == 0 and calls[-1] == "copilot push --project-dir " + notws
+          and "layout: unrecognised" in out,
+          "a push of a folder with no agent marker is left to pac, which "
+          "decides, as the README says")
 
     # ---- pack: the cloned-agent refusal
     pack = ["--pack", "--publisher-prefix", "demo", "--output-path", out_dir]
@@ -746,7 +894,7 @@ def _self_test(tmp):
           "  <-- pinned defect")
     rc, out, err, calls = drive([plain_ws] + pack)
     check(rc == 0 and calls == [] and "Check only" in out,
-          "a pack dry run does not need git, and starts no process")
+          "a pack is not gated on git, and a dry run starts no pac process")
     rc, out, err, calls = drive([tmp] + pack)
     check(rc == EXIT_REFUSED and "not an agent workspace" in out,
           "a folder that is not a workspace is refused for pack")
@@ -758,13 +906,30 @@ def _self_test(tmp):
     check(rc == 0 and len(calls) == 2,
           "two workspaces are packed one after the other")
 
+    # ---- pac cannot wait on a prompt
+    real_run = subprocess.run
+    stdin_seen = []
+
+    def spy(argv, **kwargs):
+        stdin_seen.append(kwargs.get("stdin"))
+        return real_run(argv, **kwargs)
+
+    subprocess.run = spy
+    try:
+        run_command([sys.executable, "-c", "pass"])
+    finally:
+        subprocess.run = real_run
+    check(stdin_seen == [subprocess.DEVNULL],
+          "every process runs with stdin closed, so pac cannot wait on a "
+          "prompt  <-- pinned defect")
+
     # ---- the guarantee across every run above
     seen = sorted(set(" ".join(c.split()[:2]) for c in all_calls))
     check(all(s in ALLOWED_CALLS for s in seen) and len(seen) == 4,
           "across every run only the four allowed pac calls were ever made"
           "  <-- pinned defect")
-    check(sum(1 for c in all_calls if c.startswith("copilot push")) == 3,
-          "exactly three pushes were attempted in the whole self-test, "
+    check(sum(1 for c in all_calls if c.startswith("copilot push")) == 5,
+          "exactly five pushes were attempted in the whole self-test, "
           "each one behind --push --apply")
 
     # ---- unexpected failures and odd output
