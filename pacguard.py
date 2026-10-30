@@ -27,19 +27,24 @@ it does not refresh the index either):
               the last committed state is a rollback point. A workspace that git
               ignores has none and reads UNKNOWN. --allow-dirty overrides,
               loudly.
-  pack layout pac copilot pack validates a classic workspace (agent.mcs.yml) and
-              rejects the extra files a cloned agent carries. This tool refuses
-              before the call and lists every entry at once. A CLI-authored
-              workspace (agent.sync.yaml) is not refused. --allow-cloned-pack
-              overrides, for a pac release that fixes it.
+  pack layout pac copilot pack accepts a classic workspace (agent.mcs.yml)
+              holding only a short list of top-level names and rejects every
+              other one, such as the entries a cloned agent carries. This tool
+              refuses before the call and lists every entry at once. A
+              CLI-authored workspace (agent.sync.yaml) may hold extra entries
+              but needs settings.mcs.yml and a layoutVersion line. The
+              extra-entry refusal can be overridden with --allow-cloned-pack,
+              for a pac release that accepts more. A missing file or a bad
+              layoutVersion cannot be overridden.
 
 Nothing is written by pacguard itself. pac writes when pacguard runs it, and
 pacguard runs it for push or pack only with --apply.
 
 Exit codes: 0 no check refused the run (and the call ran, with --apply). A run
-with neither --push nor --pack only reports and always exits 0, whatever it
-printed, so read the verdict lines. 1 a check refused the run, 2 a workspace or
-pac could not be found or read, 3 pac ran and exited non-zero, 64 usage error,
+with neither --push nor --pack only reports: it exits 0 whatever verdicts it
+printed, so read the verdict lines, or add --push or --pack (without --apply) to
+get exit 1 on a refusal. 1 a check refused the run, 2 a workspace or pac could
+not be found, started or read, 3 pac ran and exited non-zero, 64 usage error,
 70 an unexpected crash, which is never a finding.
 """
 
@@ -69,18 +74,19 @@ PUSH = "push"
 PACK = "pack"
 ALLOWED_CALLS = ("auth who", "copilot list", "copilot push", "copilot pack")
 
-# Entries pac copilot pack rejected at the top of a classic workspace, observed
-# on pac 2.14.1 (see README). The first group is what a cloned agent carries.
-# The second is other names the probe runs saw rejected. The third is version
-# control and editor files, which any workspace kept in git carries. The lists
-# are not complete: pac rejected every other name tried too. Matching is
-# case-insensitive.
-CLONED_ENTRIES = ("actions", "connectionreferences.mcs.yml", "connectors",
-                  "knowledge", "workflows")
-PROBED_ENTRIES = ("botcomponents", "components", "dialogs", "entities", "extra",
-                  "skills", "translations", "variables")
-TOOLING_ENTRIES = (".editorconfig", ".git", ".gitattributes", ".github",
-                   ".gitignore", ".vscode", "license", "readme.md")
+# The only top-level names pac copilot pack 2.14.1 accepted in a classic
+# workspace (see README). It rejected every other name tried, including the
+# entries a cloned agent carries and ordinary files such as CHANGELOG.md or
+# desktop.ini, so this is an allow-list. Matching is case-insensitive.
+ACCEPTED_CLASSIC = ("agent.mcs.yml", "settings.mcs.yml", "icon.png", "topics",
+                    ".mcs")
+SETTINGS_FILE = "settings.mcs.yml"
+# pac 2.14.1 recognises a CLI-authored workspace only when agent.sync.yaml has a
+# line "layoutVersion: <integer>" and the integer is at most this.
+LAYOUT_VERSION_MAX = 1
+LAYOUT_VERSION_LINE = re.compile(r"layoutVersion:[ \t]*(\d+)[ \t]*(#.*)?$")
+# agent.sync.yaml is a few lines. Reading more than this tells nothing new.
+SYNC_READ_LIMIT = 65536
 
 NOT_A_WORKSPACE = ("not an agent workspace: neither agent.mcs.yml nor "
                    "agent.sync.yaml is here")
@@ -97,10 +103,15 @@ UNKNOWN = "UNKNOWN"
 
 # A pac output line holding any of these words is withheld. pac auth who prints
 # a token expiry line, and a future version could print more. It is a keyword
-# filter, not a secret detector: a secret on a line without these words passes.
-SECRET_LIST = ("token", "secret", "password", "bearer", "authorization",
-               "credential")
-SECRET_WORDS = re.compile("|".join(SECRET_LIST), re.IGNORECASE)
+# filter plus one shape (a JWT), not a secret detector: a secret on a line
+# without these words and not shaped like a JWT passes.
+SECRET_LIST = ("token", "secret", "password", "passwd", "pwd", "bearer",
+               "authorization", "credential", "access key", "accesskey",
+               "api key", "apikey", "api-key", "private key", "sig=")
+SECRET_WORDS = re.compile("|".join(re.escape(w) for w in SECRET_LIST),
+                          re.IGNORECASE)
+JWT_SHAPE = re.compile(r"eyJ[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}")
+WITHHELD = "[line withheld: it looks like a credential]"
 
 EXIT_OK = 0
 EXIT_REFUSED = 1
@@ -158,8 +169,7 @@ def pack_verdict(entries):
     entries is a list of (name, is_dir) for the top of the workspace. Returns
     (layout, rejected). rejected names every entry pac rejects, so one run
     reports all of them and not the first. It is empty for a CLI-authored
-    workspace, which pac accepts with extra entries, and for a workspace that
-    holds nothing known to be rejected."""
+    workspace, which pac accepts with extra entries."""
     names = set(n.lower() for n, _ in entries)
     if CLI_MARKER in names:
         return LAYOUT_CLI, []
@@ -167,9 +177,31 @@ def pack_verdict(entries):
         return LAYOUT_UNKNOWN, []
     rejected = []
     for name, is_dir in sorted(entries, key=lambda e: e[0].lower()):
-        if name.lower() in CLONED_ENTRIES + PROBED_ENTRIES + TOOLING_ENTRIES:
+        if name.lower() not in ACCEPTED_CLASSIC:
             rejected.append(name + "/" if is_dir else name)
     return LAYOUT_CLASSIC, rejected
+
+
+def layout_problems(layout, entries, sync_text):
+    """What pac pack needs that is missing, whatever else is in the folder.
+    These are not overridden by --allow-cloned-pack, because pac fails on
+    them whatever its release. sync_text is the text of agent.sync.yaml."""
+    problems = []
+    if layout in (LAYOUT_CLASSIC, LAYOUT_CLI) and SETTINGS_FILE not in set(
+            n.lower() for n, _ in entries):
+        problems.append("%s is missing" % SETTINGS_FILE)
+    if layout == LAYOUT_CLI:
+        versions = [LAYOUT_VERSION_LINE.match(line)
+                    for line in sync_text.splitlines()]
+        versions = [int(m.group(1)) for m in versions if m]
+        if not versions:
+            problems.append("%s has no line 'layoutVersion: <number>'"
+                            % CLI_MARKER)
+        elif versions[0] > LAYOUT_VERSION_MAX:
+            problems.append("%s says layoutVersion %d, newer than the %d "
+                            "this tool knows" % (CLI_MARKER, versions[0],
+                                                 LAYOUT_VERSION_MAX))
+    return problems
 
 
 def classify_git(returncode, stdout, tracked=True):
@@ -188,11 +220,12 @@ def classify_git(returncode, stdout, tracked=True):
 class Assessment(object):
     """What is known about one workspace."""
 
-    def __init__(self, path, layout, rejected, git):
+    def __init__(self, path, layout, rejected, git, problems=()):
         self.path = path
         self.layout = layout
         self.rejected = rejected
         self.git = git
+        self.problems = list(problems)
 
 
 def decide(action, assessments, allow_dirty=False, allow_cloned_pack=False):
@@ -206,21 +239,33 @@ def decide(action, assessments, allow_dirty=False, allow_cloned_pack=False):
                 "rollback point, or pass --allow-dirty." % (a.path, a.git))
         if action == PACK and a.layout == LAYOUT_UNKNOWN:
             refusals.append("%s: %s" % (a.path, NOT_A_WORKSPACE))
-        elif action == PACK and a.rejected and not allow_cloned_pack:
-            refusals.append(
-                "%s: pac copilot pack rejects %s. Pass --allow-cloned-pack "
-                "if your pac release accepts them."
-                % (a.path, ", ".join(a.rejected)))
+        elif action == PACK:
+            if a.problems:
+                refusals.append("%s: pac copilot pack will fail: %s."
+                                % (a.path, "; ".join(a.problems)))
+            if a.rejected and not allow_cloned_pack:
+                refusals.append(
+                    "%s: pac copilot pack rejects %s. Pass "
+                    "--allow-cloned-pack if your pac release accepts them."
+                    % (a.path, ", ".join(a.rejected)))
     return refusals
+
+
+def looks_secret(line):
+    return bool(SECRET_WORDS.search(line) or JWT_SHAPE.search(line))
 
 
 def scrub(text):
     """Split pac output into lines and withhold any that look like a
-    credential."""
+    credential. A withheld line that ends with a colon or an equals sign is a
+    label, so the next line that holds text is its value and is withheld too."""
     lines = []
+    value_next = False
     for line in text.splitlines():
-        if SECRET_WORDS.search(line):
-            line = "[line withheld: it looks like a credential]"
+        secret = looks_secret(line)
+        if secret or (value_next and line.strip()):
+            value_next = secret and line.rstrip().endswith((":", "="))
+            line = WITHHELD
         lines.append(line)
     return lines
 
@@ -270,10 +315,12 @@ def list_entries(path):
 
 def git_state(path, git="git"):
     """--no-optional-locks keeps git status from rewriting .git/index.
-    --untracked-files=all overrides a status.showUntrackedFiles setting that
-    would hide a new file. "-- ." scopes status to the workspace, and ls-files
-    lists only the current directory by default."""
-    base = [git, "--no-optional-locks"]
+    core.fsmonitor=false stops a workspace copied from elsewhere from naming a
+    command in its own .git/config for git to run. --untracked-files=all
+    overrides a status.showUntrackedFiles setting that would hide a new file.
+    "-- ." scopes status to the workspace, and ls-files lists only the current
+    directory by default."""
+    base = [git, "--no-optional-locks", "-c", "core.fsmonitor=false"]
     try:
         rc, out, _ = run_command(
             base + ["status", "--porcelain", "--untracked-files=all", "--",
@@ -284,9 +331,23 @@ def git_state(path, git="git"):
     return classify_git(rc, out, bool(listed.strip()))
 
 
+def read_sync(path, entries):
+    """The text of agent.sync.yaml, or "" when it cannot be read. Call it only
+    when the listing holds the marker."""
+    name = next(n for n, _ in entries if n.lower() == CLI_MARKER)
+    try:
+        with open(os.path.join(path, name), "rb") as fh:
+            return fh.read(SYNC_READ_LIMIT).decode("utf-8-sig", "replace")
+    except OSError:
+        return ""
+
+
 def assess(path):
-    layout, rejected = pack_verdict(list_entries(path))
-    return Assessment(path, layout, rejected, git_state(path))
+    entries = list_entries(path)
+    layout, rejected = pack_verdict(entries)
+    sync_text = read_sync(path, entries) if layout == LAYOUT_CLI else ""
+    return Assessment(path, layout, rejected, git_state(path),
+                      layout_problems(layout, entries, sync_text))
 
 
 def resolve_pac(value):
@@ -322,14 +383,18 @@ def describe(a):
             UNKNOWN: "git could not say, or tracks no file here, so the "
                      "state is not known"}[a.git]
     print("  git: %s (%s)" % (a.git, note))
-    if a.layout == LAYOUT_CLI:
-        print("  pack: ok (pac accepts extra entries in this layout)")
-    elif a.layout == LAYOUT_UNKNOWN:
+    if a.layout == LAYOUT_UNKNOWN:
         print("  pack: %s" % NOT_A_WORKSPACE)
+        return
+    if a.problems:
+        print("  pack: pac will fail: %s" % "; ".join(a.problems))
+    if a.layout == LAYOUT_CLI:
+        if not a.problems:
+            print("  pack: ok (pac accepts extra entries in this layout)")
     elif a.rejected:
         print("  pack: pac rejects %s" % ", ".join(a.rejected))
-    else:
-        print("  pack: ok (nothing here is known to be rejected)")
+    elif not a.problems:
+        print("  pack: ok (every top-level entry is one pac accepts)")
 
 
 # ------------------------------------------------------------------ self-test
@@ -354,11 +419,23 @@ if args[:1] == ["auth"]:
     if "unicode" in mode:
         sys.stdout.buffer.write(b"snowman \xe2\x98\x83\n")
         sys.stdout.buffer.flush()
+    if "latin1" in mode:
+        sys.stdout.buffer.write(b"caf\xe9 agent\n")
+        sys.stdout.buffer.flush()
+    if "bare" in mode:
+        print("eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0.c2ln")
+        print("Access key:")
+        print("a1b2c3d4e5")
+        print("tester@example.invalid")
 if args[:1] == ["copilot"]:
     print("stub: copilot " + " ".join(args[1:2]))
-if mode and (args[0] if args[0] != "copilot" else args[1]) in mode.split(","):
+verb = args[0] if args[0] != "copilot" else args[1]
+if verb in mode.split(","):
     sys.stderr.write("stub failure\n")
     sys.exit(7)
+if verb + "=1" in mode.split(","):
+    sys.stderr.write("stub failure\n")
+    sys.exit(1)
 '''
 
 
@@ -444,14 +521,15 @@ def _self_test(tmp):
                      "commit.gpgsign=false", "commit", "-q", "-m", "x"],
                     cwd=path)
 
-    def make(name, files=(), dirs=(), commit=None):
+    def make(name, files=(), dirs=(), commit=None, texts=None):
         """A workspace. commit True makes a repository with one commit,
-        False leaves untracked files in a repository, None no repository."""
+        False leaves untracked files in a repository, None no repository.
+        texts maps a file name to the text it holds."""
         path = os.path.join(tmp, name)
         os.mkdir(path)
         for f in files:
             with open(os.path.join(path, f), "w") as fh:
-                fh.write("synthetic: 1\n")
+                fh.write((texts or {}).get(f, "synthetic: 1\n"))
         for d in dirs:
             os.mkdir(os.path.join(path, d))
         if commit is not None:
@@ -470,8 +548,9 @@ def _self_test(tmp):
     cloned_ws = make("cloned", classic + ("connectionreferences.mcs.yml",),
                      ("topics", "actions", "connectors", "knowledge",
                       "workflows"), commit=True)
+    sync_ok = {"agent.sync.yaml": "# marker\nlayoutVersion: 1\n"}
     cli_ws = make("cli", ("agent.sync.yaml", "settings.mcs.yml", "README.md"),
-                  ("actions", ".git"))
+                  ("actions", ".git"), texts=sync_ok)
     out_dir = os.path.join(tmp, "out")
 
     # ---- the argv builder: four calls, exact, long names only
@@ -534,6 +613,23 @@ def _self_test(tmp):
           "a CLI-authored workspace with the same extras is not refused"
           "  <-- pinned defect")
     layout, bad = pack_verdict(entries(
+        "agent.mcs.yml", "CHANGELOG.md", "LICENSE.md", "CLAUDE.md",
+        ".gitkeep", ".claude/", ".idea/", ".vs/", "desktop.ini", "Thumbs.db",
+        "notes.txt"))
+    check(bad == [".claude/", ".gitkeep", ".idea/", ".vs/", "CHANGELOG.md",
+                  "CLAUDE.md", "desktop.ini", "LICENSE.md", "notes.txt",
+                  "Thumbs.db"],
+          "a name that is not on the accepted list is rejected, whatever it "
+          "is  <-- pinned defect")
+    layout, bad = pack_verdict(entries(
+        "agent.mcs.yml", "Zeta.md", "alpha.md"))
+    check(bad == ["alpha.md", "Zeta.md"],
+          "rejected entries are listed in case-insensitive order")
+    layout, bad = pack_verdict(entries(
+        "AGENT.mcs.yml", "Settings.MCS.yml", "ICON.PNG", "Topics/", ".MCS/"))
+    check(layout == LAYOUT_CLASSIC and bad == [],
+          "the five accepted names match without regard to case")
+    layout, bad = pack_verdict(entries(
         "agent.mcs.yml", "extra/", "entities/", "variables/", "dialogs/",
         "translations/", "skills/", "components/", "botcomponents/"))
     check(bad == ["botcomponents/", "components/", "dialogs/", "entities/",
@@ -549,13 +645,48 @@ def _self_test(tmp):
     layout, bad = pack_verdict(entries(
         "agent.sync.yaml", "agent.mcs.yml", "actions/"))
     check(layout == LAYOUT_CLI and bad == [],
-          "with both markers the workspace counts as cli-authored and is "
-          "never refused")
+          "with both markers the workspace counts as cli-authored, which is "
+          "how pac 2.14.1 reads it when agent.sync.yaml is valid")
     layout, bad = pack_verdict(entries("notes.txt"))
     check(layout == LAYOUT_UNKNOWN and bad == [],
           "a folder with neither marker is an unrecognised layout")
     layout, bad = pack_verdict([])
     check(layout == LAYOUT_UNKNOWN, "an empty folder is an unrecognised layout")
+
+    # ---- what pac needs besides the right names
+    both = entries("agent.mcs.yml", "settings.mcs.yml")
+    check(layout_problems(LAYOUT_CLASSIC, both, "") == [],
+          "a classic workspace with settings.mcs.yml has no problem")
+    check(layout_problems(LAYOUT_CLASSIC, entries("agent.mcs.yml"), "") ==
+          ["settings.mcs.yml is missing"],
+          "a classic workspace without settings.mcs.yml will fail in pac"
+          "  <-- pinned defect")
+    check(layout_problems(LAYOUT_UNKNOWN, [], "") == [],
+          "an unrecognised folder has no separate problem, it is refused "
+          "whole")
+    cli_entries = entries("agent.sync.yaml", "settings.mcs.yml")
+    for text in ("layoutVersion: 1\n", "layoutVersion: 0\n",
+                 "a: 1\r\nlayoutVersion: 1 # note\r\n",
+                 "layoutVersion:\t1\n", "layoutVersion:1\n"):
+        check(layout_problems(LAYOUT_CLI, cli_entries, text) == [],
+              "a CLI-authored workspace with %r reads as valid" % (text,))
+    for text in ("", "a: 1\n", "layoutVersion: abc\n",
+                 'layoutVersion: "1"\n', "layoutVersion: 1.0\n",
+                 "layoutversion: 1\n", "  layoutVersion: 1\n",
+                 "layoutVersion: -1\n"):
+        check(len(layout_problems(LAYOUT_CLI, cli_entries, text)) == 1 and
+              "layoutVersion" in layout_problems(
+                  LAYOUT_CLI, cli_entries, text)[0],
+              "a CLI-authored workspace with %r has no usable layoutVersion"
+              "  <-- pinned defect" % (text,))
+    check("newer than" in layout_problems(
+        LAYOUT_CLI, cli_entries, "layoutVersion: 2\n")[0],
+        "a layoutVersion above the one pac 2.14.1 knows is a problem")
+    check(layout_problems(LAYOUT_CLI, entries("agent.sync.yaml"),
+                          "layoutVersion: 1\n") ==
+          ["settings.mcs.yml is missing"],
+          "a CLI-authored workspace without settings.mcs.yml will fail in "
+          "pac  <-- pinned defect")
 
     # ---- git state
     check(classify_git(0, "") == CLEAN, "empty porcelain output is CLEAN")
@@ -639,6 +770,22 @@ def _self_test(tmp):
           "the check leaves .git/index byte for byte as it was, and a plain "
           "git status would not  <-- pinned defect")
 
+    # A workspace copied from elsewhere can name a command in its own
+    # .git/config for git status to run. The check must not run it.
+    fsm_ws = make("fsm", classic, ("topics",), commit=True)
+    ran = os.path.join(tmp, "fsmonitor-ran.txt")
+    run_command(["git", "config", "core.fsmonitor",
+                 'echo ran >> "%s" #' % ran.replace(os.sep, "/")], cwd=fsm_ws)
+    run_command(["git", "status", "--porcelain"], cwd=fsm_ws)
+    control = os.path.exists(ran)
+    with contextlib.suppress(OSError):
+        os.remove(ran)
+    fsm_state = git_state(fsm_ws)
+    check(control and not os.path.exists(ran) and fsm_state == CLEAN,
+          "the check does not run a core.fsmonitor command from the "
+          "workspace's own git config, and a plain git status would"
+          "  <-- pinned defect")
+
     # ---- the decision
     def a_(git, rejected=(), layout=LAYOUT_CLASSIC):
         return Assessment("w", layout, list(rejected), git)
@@ -663,6 +810,18 @@ def _self_test(tmp):
           "a DIRTY worktree does not stop a pack, which only reads")
     check(decide(PACK, [a_(CLEAN, ["actions/"])], allow_cloned_pack=True)
           == [], "--allow-cloned-pack lets the pack through")
+    missing_one = Assessment("w", LAYOUT_CLASSIC, [], CLEAN,
+                             ["settings.mcs.yml is missing"])
+    check(len(decide(PACK, [missing_one], allow_cloned_pack=True)) == 1
+          and "settings.mcs.yml is missing" in decide(
+              PACK, [missing_one])[0],
+          "a missing required file refuses the pack and no override lifts it"
+          "  <-- pinned defect")
+    check(len(decide(PACK, [Assessment("w", LAYOUT_CLASSIC, ["x/"], CLEAN,
+                                       ["settings.mcs.yml is missing"])])) == 2,
+          "a missing file and a rejected entry are both reported")
+    check(decide(PUSH, [missing_one]) == [],
+          "a missing pack file does not stop a push")
 
     # ---- output hygiene
     check(scrub("Access Token: abc\nUser: a") ==
@@ -676,9 +835,28 @@ def _self_test(tmp):
               and scrub("x %s y" % word.upper())[0].startswith("[line"),
               "a line holding %r is withheld in either case  <-- pinned "
               "defect" % word)
-    check(scrub("sig=abc123 key=zzz") == ["sig=abc123 key=zzz"],
-          "a line with none of the six words is printed, the filter is a "
+    check(scrub("name=abc123 key=zzz") == ["name=abc123 key=zzz"],
+          "a line with none of the listed words is printed, the filter is a "
           "keyword list and not a secret detector")
+    for word in ("passwd", "pwd", "access key", "accesskey", "api key",
+                 "apikey", "api-key", "private key", "sig="):
+        check(scrub("x %s y" % word)[0] == WITHHELD,
+              "a line holding %r is withheld  <-- pinned defect" % word)
+    check(scrub("eyJhbGciOiJub25lIn0.eyJzdWIiOiJ4In0.c2ln") == [WITHHELD],
+          "a bare JWT on a line of its own is withheld  <-- pinned defect")
+    check(scrub("eyJ.x\neyJhbGci") == ["eyJ.x", "eyJhbGci"],
+          "text that only starts like a JWT is printed")
+    check(scrub("Access key:\n\nabc\nafter") ==
+          [WITHHELD, "", WITHHELD, "after"],
+          "the value on the line after a label is withheld too, a blank line "
+          "between does not save it  <-- pinned defect")
+    check(scrub("Access key: abc\nafter") == [WITHHELD, "after"],
+          "a label with its value on the same line withholds only that line")
+    check(scrub("Token=\nabc\nafter") == [WITHHELD, WITHHELD, "after"],
+          "a label that ends with an equals sign withholds the next line")
+    check(scrub("Token:\npassword:\nabc\nafter") ==
+          [WITHHELD, WITHHELD, WITHHELD, "after"],
+          "two labels in a row withhold the value after the second")
     check(scrub("") == [], "empty output is no lines")
     buf = io.StringIO()
     echo("a\n\nb\n", buf)
@@ -751,6 +929,8 @@ def _self_test(tmp):
     check("layout: classic" in out and "git: CLEAN" in out and
           "tester@example.invalid" in out,
           "the default run prints the layout, the git state and pac's answer")
+    check("Check only" not in out and "would run" not in out,
+          "a report-only run does not claim a call was held back")
     check(sorted(os.listdir(clean_ws)) == snapshot and
           git_state(clean_ws) == CLEAN,
           "the default run changes nothing in the workspace")
@@ -764,7 +944,7 @@ def _self_test(tmp):
     rc, out, err, calls = drive([plain_ws, "--offline"])
     check(rc == 0 and "git: UNKNOWN" in out,
           "a report-only run exits 0 even when git is UNKNOWN, as the README "
-          "says")
+          "says  <-- pinned defect")
     rc, out, err, calls = drive([tmp, "--offline"])
     check(rc == 0 and "layout: unrecognised" in out
           and "not an agent workspace" in out,
@@ -789,6 +969,15 @@ def _self_test(tmp):
           and "withheld" in err,
           "a credential-looking line on pac's stderr is withheld too"
           "  <-- pinned defect")
+    rc, out, err, calls = drive([clean_ws], mode="bare")
+    check(rc == 0 and "eyJ" not in out + err and "a1b2c3d4e5" not in out
+          and out.count("tester@example.invalid") == 2,
+          "a bare JWT line and the value under a label are withheld, the "
+          "lines around them are printed  <-- pinned defect")
+    rc, out, err, calls = drive([clean_ws], mode="latin1")
+    check(rc == 0 and "caf" + chr(0xfffd) + " agent" in out,
+          "bytes that are not UTF-8 print as a replacement character and the "
+          "run goes on  <-- pinned defect")
     rc, out, err, calls = drive([clean_ws], mode="auth")
     check(rc == EXIT_PAC and calls == ["auth who"] and "exited 7" in err,
           "a failing pac auth who exits 3 and stops before list")
@@ -849,9 +1038,21 @@ def _self_test(tmp):
     rc, out, err, calls = drive([clean_ws, "--push", "--apply"], mode="push")
     check(rc == EXIT_PAC and "exited 7" in err and "pushed" not in out,
           "a failed push exits 3 and never claims it pushed")
+    rc, out, err, calls = drive([clean_ws, "--push", "--apply"],
+                                mode="push=1")
+    check(rc == EXIT_PAC and "exited 1" in err and "pushed" not in out
+          and calls[-1].startswith("copilot push"),
+          "a push where pac exits 1, the code real pac gave for a failed "
+          "push, exits 3 and never claims it pushed  <-- pinned defect")
     rc, out, err, calls = drive([clean_ws, "--push", "--apply"], mode="auth")
     check(rc == EXIT_PAC and calls == ["auth who"],
           "a failed sign-in check stops the push before it starts")
+    rc, out, err, calls = drive([plain_ws, "--push", "--apply",
+                                 "--allow-dirty"])
+    check(rc == 0 and "ALLOW-DIRTY" in out and "git: UNKNOWN" in out
+          and calls[-1] == "copilot push --project-dir " + plain_ws,
+          "--allow-dirty pushes where git is UNKNOWN and says so"
+          "  <-- pinned defect")
 
     notws = make("notws", ("notes.txt",), commit=True)
     rc, out, err, calls = drive([notws, "--push", "--apply"])
@@ -906,6 +1107,63 @@ def _self_test(tmp):
     check(rc == 0 and len(calls) == 2,
           "two workspaces are packed one after the other")
 
+    extras_ws = make("extras", classic + ("CHANGELOG.md", "desktop.ini"),
+                     ("topics", ".idea"))
+    rc, out, err, calls = drive([extras_ws] + pack)
+    check(rc == EXIT_REFUSED and calls == [] and "desktop.ini" in out
+          and "CHANGELOG.md" in out and ".idea/" in out
+          and "pack: ok" not in out,
+          "a classic workspace with ordinary files pac does not know is "
+          "refused for pack, not reported ok  <-- pinned defect")
+    nosettings_ws = make("nosettings", ("agent.mcs.yml",), ("topics",))
+    rc, out, err, calls = drive([nosettings_ws, "--allow-cloned-pack"] + pack)
+    check(rc == EXIT_REFUSED and calls == []
+          and "settings.mcs.yml is missing" in out
+          and "pack: pac will fail" in out and "pack: ok" not in out,
+          "a classic workspace without settings.mcs.yml is refused for pack "
+          "and --allow-cloned-pack does not lift it  <-- pinned defect")
+    both_bad = make("bothbad", classic + ("agent.sync.yaml",), ("topics",))
+    rc, out, err, calls = drive([both_bad] + pack)
+    check(rc == EXIT_REFUSED and calls == [] and "layoutVersion" in out
+          and "pack: ok" not in out,
+          "a workspace with both markers and an agent.sync.yaml pac cannot "
+          "read is refused for pack  <-- pinned defect")
+    both_ok = make("bothok", classic + ("agent.sync.yaml",), ("topics",),
+                   texts=sync_ok)
+    rc, out, err, calls = drive([both_ok, "--apply"] + pack)
+    check(rc == 0 and len(calls) == 1 and "layout: cli-authored" in out,
+          "a workspace with both markers and a valid agent.sync.yaml packs, "
+          "as pac 2.14.1 does")
+    newer_ws = make("newer", ("agent.sync.yaml", "settings.mcs.yml"), (),
+                    texts={"agent.sync.yaml": "layoutVersion: 2\n"})
+    rc, out, err, calls = drive([newer_ws] + pack)
+    check(rc == EXIT_REFUSED and "newer than" in out and calls == [],
+          "a layoutVersion newer than pac 2.14.1 supports is refused for pack")
+    syncdir_ws = make("syncdir", ("settings.mcs.yml",), ("agent.sync.yaml",))
+    rc, out, err, calls = drive([syncdir_ws] + pack)
+    check(rc == EXIT_REFUSED and "layoutVersion" in out,
+          "a folder named agent.sync.yaml has no layoutVersion to read")
+    bom_ws = make("bom", ("settings.mcs.yml",))
+    with open(os.path.join(bom_ws, "agent.sync.yaml"), "wb") as fh:
+        fh.write(b"\xef\xbb\xbflayoutVersion: 1\r\n")
+    check(assess(bom_ws).problems == [],
+          "a byte order mark before layoutVersion is read past, as pac does")
+    entries_bom = list_entries(bom_ws)
+    globals()["open"] = lambda *a, **k: (_ for _ in ()).throw(OSError("x"))
+    try:
+        unreadable = read_sync(bom_ws, entries_bom)
+    finally:
+        del globals()["open"]
+    check(unreadable == "", "an agent.sync.yaml that cannot be read is empty "
+          "text, so the pack is refused and not crashed")
+
+    uni_ws = make("caf\u00e9 ws", classic, ("topics",), commit=True)
+    rc, out, err, calls = drive([uni_ws, "--push"])
+    check(rc == 0 and "caf\u00e9 ws" in out and "git: CLEAN" in out
+          and calls == ["auth who", "copilot list"],
+          "a workspace whose name has a non-ASCII character and a space is "
+          "checked like any other")
+
     # ---- pac cannot wait on a prompt
     real_run = subprocess.run
     stdin_seen = []
@@ -928,8 +1186,8 @@ def _self_test(tmp):
     check(all(s in ALLOWED_CALLS for s in seen) and len(seen) == 4,
           "across every run only the four allowed pac calls were ever made"
           "  <-- pinned defect")
-    check(sum(1 for c in all_calls if c.startswith("copilot push")) == 5,
-          "exactly five pushes were attempted in the whole self-test, "
+    check(sum(1 for c in all_calls if c.startswith("copilot push")) == 7,
+          "exactly seven pushes were attempted in the whole self-test, "
           "each one behind --push --apply")
 
     # ---- unexpected failures and odd output
@@ -948,6 +1206,37 @@ def _self_test(tmp):
     check(rc == EXIT_CRASH and "fault in the tool" in err.getvalue(),
           "an unexpected exception exits 70, not the 1 that means refused"
           "  <-- pinned defect")
+
+    def cannot_start(argv, cwd=None):
+        raise OSError("synthetic: not executable")
+
+    globals()["run_command"] = cannot_start
+    try:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = main(["--pac", stub, clean_ws])
+    finally:
+        globals()["run_command"] = original
+    check(rc == EXIT_MISSING and "could not be started" in err.getvalue()
+          and "Traceback" not in err.getvalue(),
+          "a pac that is found but cannot start exits 2 with advice, not 70 "
+          "with a traceback  <-- pinned defect")
+
+    def leaks(argv, cwd=None):
+        raise RuntimeError("Authorization: Bearer not-a-real-value-0003")
+
+    globals()["run_command"] = leaks
+    try:
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            rc = main(["--pac", stub, clean_ws])
+    finally:
+        globals()["run_command"] = original
+    check(rc == EXIT_CRASH and "fault in the tool" in err.getvalue()
+          and "Traceback" in err.getvalue()
+          and "not-a-real-value-0003" not in err.getvalue(),
+          "the message and the traceback of a crash pass the credential "
+          "filter too  <-- pinned defect")
     os.environ["PACGUARD_STUB_MODE"] = "unicode"
     raw = io.BytesIO()
     narrow = io.TextIOWrapper(raw, encoding="ascii")
@@ -1057,7 +1346,10 @@ def _build_parser():
         description="Wrap pac for a Copilot Studio agent workspace. Checks "
                     "by default. Only --apply changes anything.",
         epilog="Every flag must be spelled in full. Nothing runs against "
-               "the live agent without --push and --apply.",
+               "the live agent without --push and --apply. A run with no "
+               "--push and no --pack only reports and exits 0 whatever it "
+               "printed. Add --push or --pack, without --apply, to get exit "
+               "1 on a refusal.",
         allow_abbrev=False,
     )
     ap.add_argument("workspace", nargs="*", metavar="WORKSPACE",
@@ -1080,8 +1372,8 @@ def _build_parser():
                     help="push even when git status is not CLEAN")
     ap.add_argument("--allow-cloned-pack", dest="allow_cloned_pack",
                     action="store_true",
-                    help="pack even when the layout lists entries pac "
-                         "rejected")
+                    help="pack even when the workspace holds top-level "
+                         "entries pac rejects. It does not lift a missing file.")
     ap.add_argument("--apply", action="store_true",
                     help="run the --push or --pack call. Without this "
                          "nothing is changed.")
@@ -1111,10 +1403,13 @@ def main(argv=None):
     try:
         return _run(argv)
     except Exception as exc:
+        # The message and the traceback can hold pac output, so they pass the
+        # same filter as everything else pac said.
         print("error: unexpected %s: %s. This is a fault in the tool, not a "
-              "finding about the workspace." % (type(exc).__name__, exc),
+              "finding about the workspace." % (
+                  type(exc).__name__, " ".join(scrub(str(exc)))),
               file=sys.stderr)
-        traceback.print_exc()
+        print("\n".join(scrub(traceback.format_exc())), file=sys.stderr)
         return EXIT_CRASH
 
 
@@ -1186,7 +1481,13 @@ def _run(argv):
             return EXIT_MISSING
 
     for call in calls:
-        rc = run_pac(pac, call)
+        try:
+            rc = run_pac(pac, call)
+        except OSError as exc:
+            print("error: pac was found but could not be started (%s). Check "
+                  "that %s is the Power Platform CLI and can be executed."
+                  % (exc, args.pac), file=sys.stderr)
+            return EXIT_MISSING
         if rc != 0:
             print("error: pac %s exited %d." % (" ".join(call[:2]), rc),
                   file=sys.stderr)
